@@ -7,7 +7,6 @@ import numpy as np
 from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
 from g2p_en import G2p
-import io
 import nltk
 import tensorflow as tf
 import tempfile
@@ -47,6 +46,32 @@ LSTM_CONFIG = {
     'window_length': 400  # 25ms at 16kHz
 }
 
+# Path to the LSTM model
+LSTM_MODEL_PATH = 'models/phoneme.h5'
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG, 
+    format='%(asctime)s - %(levelname)s: %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Download NLTK resources if needed
+try:
+    nltk.data.find('taggers/averaged_perceptron_tagger')
+except LookupError:
+    nltk.download('averaged_perceptron_tagger')
+
+app = Flask(__name__)
+CORS(app)
+
+# Initialize G2p
+g2p = G2p()
+
+# Initialize models
+wav2vec_model, wav2vec_processor = None, None
+lstm_model = None
+
 # Load the pre-trained phoneme model
 def load_phoneme_model(model_path):
     """
@@ -74,6 +99,13 @@ def load_phoneme_model(model_path):
         logger.error(f"Error loading LSTM model: {e}")
         logger.error(traceback.format_exc())
         return None
+
+def init_wav2vec():
+    """Initialize and return Wav2Vec 2.0 model and processor"""
+    logger.info("Loading Wav2Vec 2.0 model and processor...")
+    processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
+    model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-base-960h")
+    return model, processor
 
 def extract_audio_features(audio_path, config=LSTM_CONFIG):
     """
@@ -156,97 +188,19 @@ def arpabet_to_ipa_seq(phonemes):
     """
     return ''.join(ARPABET_TO_IPA.get(p.rstrip('012'), p) for p in phonemes)
 
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG, 
-    format='%(asctime)s - %(levelname)s: %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# Download NLTK resources if needed
-try:
-    nltk.data.find('taggers/averaged_perceptron_tagger')
-except LookupError:
-    nltk.download('averaged_perceptron_tagger')
-
-app = Flask(__name__)
-CORS(app)
-
-# Initialize G2p
-g2p = G2p()
-
-# Initialize models
-wav2vec_model, wav2vec_processor = None, None
-lstm_model = None
-
-def init_wav2vec():
-    """Initialize and return Wav2Vec 2.0 model and processor"""
-    logger.info("Loading Wav2Vec 2.0 model and processor...")
-    processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
-    model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-base-960h")
-    return model, processor
-
 @app.route('/')
 def index():
     return render_template('index.html')
 
-@app.route('/upload-model', methods=['POST'])
-def upload_model():
-    """Handle uploading of LSTM model H5 file"""
-    global lstm_model
-    
-    try:
-        if 'model' not in request.files:
-            return jsonify({"error": "No model file provided"}), 400
-            
-        model_file = request.files['model']
-        
-        if not model_file.filename.endswith('.h5'):
-            return jsonify({"error": "Invalid model file. Must be .h5 format"}), 400
-            
-        # Save model to temporary file
-        with tempfile.NamedTemporaryFile(suffix='.h5', delete=False) as temp_file:
-            model_file.save(temp_file.name)
-            model_path = temp_file.name
-            
-        # Load the model
-        lstm_model = load_phoneme_model(model_path)
-        
-        # Remove temp file after loading
-        os.unlink(model_path)
-        
-        if lstm_model is None:
-            return jsonify({"error": "Failed to load model"}), 500
-            
-        return jsonify({"message": "Model loaded successfully"}), 200
-        
-    except Exception as e:
-        logger.error(f"Error uploading model: {e}")
-        logger.error(traceback.format_exc())
-        return jsonify({"error": "Model upload failed", "details": str(e)}), 500
-
 @app.route('/speech-to-text', methods=['POST'])
 def speech_to_text():
     """
-    Convert WAV file to text and phonemes using either Wav2Vec or LSTM model
+    Convert WAV file to text and phonemes using available models
+    Prioritizes LSTM model if available, falls back to Wav2Vec
     """
     global wav2vec_model, wav2vec_processor, lstm_model
     
     try:
-        # Check if model selection specified
-        model_choice = request.form.get('model_choice', 'wav2vec')
-        
-        # Check if using LSTM but model not loaded
-        if model_choice == 'lstm' and lstm_model is None:
-            return jsonify({
-                "error": "LSTM model not loaded", 
-                "details": "Please upload an LSTM model first"
-            }), 400
-        
-        # Initialize Wav2Vec model if needed and using wav2vec
-        if model_choice == 'wav2vec' and (wav2vec_model is None or wav2vec_processor is None):
-            wav2vec_model, wav2vec_processor = init_wav2vec()
-        
         # Check if audio file is in the request
         if 'audio' not in request.files:
             logger.error("No audio file in request")
@@ -257,7 +211,6 @@ def speech_to_text():
         # Log file details for debugging
         logger.info(f"Received file: {audio_file.filename}")
         logger.info(f"File content type: {audio_file.content_type}")
-        logger.info(f"Using model: {model_choice}")
         
         # Validate file type
         if not audio_file.filename.lower().endswith('.wav'):
@@ -288,8 +241,12 @@ def speech_to_text():
         
         logger.info(f"Temporary file created at: {temp_file_path}")
         
-        # Process based on model choice
-        if model_choice == 'lstm':
+        # Determine which model to use - prefer LSTM if available
+        use_lstm = lstm_model is not None
+        recognition_method = "LSTM" if use_lstm else "Wav2Vec"
+        logger.info(f"Using {recognition_method} model for processing")
+        
+        if use_lstm:
             # Process with LSTM model
             text = "LSTM Direct Phoneme Recognition"  # LSTM doesn't produce text directly
             
@@ -299,7 +256,11 @@ def speech_to_text():
             # Predict phonemes using LSTM
             phonemes = predict_phonemes_with_lstm(lstm_model, features)
             
-        else:  # Default to wav2vec
+        else:
+            # Initialize Wav2Vec model if needed
+            if wav2vec_model is None or wav2vec_processor is None:
+                wav2vec_model, wav2vec_processor = init_wav2vec()
+                
             # Load the audio using torchaudio
             waveform, sample_rate = torchaudio.load(temp_file_path)
             
@@ -342,7 +303,7 @@ def speech_to_text():
             "original_text": text,
             "phonemes": phonemes,
             "ipa": ipa,
-            "recognition_method": model_choice
+            "recognition_method": recognition_method
         })
         
     except Exception as e:
@@ -354,16 +315,19 @@ def speech_to_text():
         }), 500
 
 if __name__ == '__main__':
-    # Default model path - will be overridden by uploads
-    DEFAULT_MODEL_PATH = 'phoneme.h5'
+    # Create models directory if it doesn't exist
+    os.makedirs('models', exist_ok=True)
     
-    # Try to pre-load LSTM model if available
-    if os.path.exists(DEFAULT_MODEL_PATH):
-        lstm_model = load_phoneme_model(DEFAULT_MODEL_PATH)
+    # Try to pre-load LSTM model
+    if os.path.exists(LSTM_MODEL_PATH):
+        lstm_model = load_phoneme_model(LSTM_MODEL_PATH)
+        logger.info("LSTM model loaded successfully")
     else:
-        logger.warning(f"Default LSTM model not found at {DEFAULT_MODEL_PATH}")
+        logger.warning(f"LSTM model not found at {LSTM_MODEL_PATH}")
+        logger.info("Will fall back to Wav2Vec model")
     
-    # Pre-load Wav2Vec model and processor
-    wav2vec_model, wav2vec_processor = init_wav2vec()
+    # Pre-load Wav2Vec model and processor as fallback
+    if lstm_model is None:
+        wav2vec_model, wav2vec_processor = init_wav2vec()
     
     app.run(debug=True)
